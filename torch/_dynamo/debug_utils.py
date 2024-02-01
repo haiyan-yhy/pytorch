@@ -1,3 +1,5 @@
+# mypy: disable-error-code="method-assign"
+
 import copy
 import functools
 import getpass
@@ -9,7 +11,7 @@ import tempfile
 import textwrap
 from collections import Counter
 from importlib import import_module
-from typing import Callable, Optional, Sequence, TypeVar
+from typing import Callable, Optional, TypeVar
 
 import torch
 import torch._prims_common as utils
@@ -32,7 +34,7 @@ inductor_config = import_module("torch._inductor.config")
 use_buck = inductor_config.is_fbcode()
 
 if use_buck:
-    import libfb.py.build_info  # type: ignore[import]
+    import libfb.py.build_info
 
 
 extra_deps = []
@@ -44,7 +46,7 @@ if use_buck:
         "//deeplearning/fbgemm/fbgemm_gpu:sparse_ops_cpu",
         "//deeplearning/fbgemm/fbgemm_gpu:sparse_ops",
     ]
-    cur_target = libfb.py.build_info.BuildInfo.get_build_rule().replace("fbcode:", "//")
+    cur_target = libfb.py.build_info.BuildInfo.get_build_rule().replace("fbcode:", "//")  # type: ignore[possibly-undefined]
     extra_imports = "\n".join([f'torch.ops.load_library("{x}")' for x in extra_deps])
 
 
@@ -86,6 +88,7 @@ python_binary(
 {extra_cpp_deps}
     ],
     main_module = "{self.path}",
+    par_style = "xar",
 )
 """
         )
@@ -223,8 +226,8 @@ def _cuda_system_info_comment():
 
     model_str = "# CUDA Info: \n"
     try:
-        cuda_version_out = subprocess.run(["nvcc", "--version"], stdout=subprocess.PIPE)
-        cuda_version_lines = cuda_version_out.stdout.decode().split("\n")
+        cuda_version_out = subprocess.check_output(["nvcc", "--version"])
+        cuda_version_lines = cuda_version_out.decode().split("\n")
         comment = "".join([f"# {s} \n" for s in cuda_version_lines if s not in [""]])
         model_str += f"{comment}\n"
     except FileNotFoundError:
@@ -248,13 +251,16 @@ def generate_config_string(*, stable_output=False):
     if stable_output:
         return "# config omitted due to stable_output=True"
 
+    experimental_config = torch.fx.experimental._config.codegen_config()  # type: ignore[attr-defined]
     return f"""\
 import torch._dynamo.config
 import torch._inductor.config
 import torch._functorch.config
+import torch.fx.experimental._config
 {torch._dynamo.config.codegen_config()}
 {torch._inductor.config.codegen_config()}
 {torch._functorch.config.codegen_config()}
+{experimental_config}
 """
 
 
@@ -487,8 +493,10 @@ def backend_accuracy_fails(
 
 
 def _stride_or_default(
-    stride: Optional[Sequence[int]], *, shape: Sequence[int]
-) -> Sequence[int]:
+    stride: Optional["torch._prims_common.StrideType"],
+    *,
+    shape: "torch._prims_common.ShapeType",
+) -> "torch._prims_common.StrideType":
     return stride if stride is not None else utils.make_contiguous_strides_for(shape)
 
 

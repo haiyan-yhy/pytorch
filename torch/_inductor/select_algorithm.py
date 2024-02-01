@@ -3,6 +3,7 @@ import functools
 import inspect
 import itertools
 import logging
+import operator
 import sys
 import textwrap
 import time
@@ -21,11 +22,17 @@ from . import config, ir
 from .autotune_process import TensorMeta, TritonBenchmarkRequest
 from .codecache import code_hash, PersistentCache, PyCodeCache
 from .codegen.common import ChoiceCaller, IndentedBuffer, KernelTemplate
-from .codegen.cuda.cuda_kernel import CUDATemplateCaller
 from .codegen.triton import texpr, TritonKernel, TritonPrinter, TritonScheduling
 from .codegen.triton_utils import config_of, signature_to_meta
 from .exc import CUDACompileError
-from .utils import do_bench, Placeholder, sympy_dot, sympy_product, unique
+from .utils import (
+    do_bench,
+    get_dtype_size,
+    Placeholder,
+    sympy_dot,
+    sympy_product,
+    unique,
+)
 from .virtualized import V
 
 log = logging.getLogger(__name__)
@@ -107,6 +114,24 @@ class TritonTemplateKernel(TritonKernel):
         self.epilogue_fn = epilogue_fn
         self.render_hooks = dict()
 
+    def need_numel_args(self):
+        return False
+
+    def estimate_kernel_num_bytes(self):
+        """
+        Estimate the total number of bytes this kernel takes.
+        For in/out nodes, sizes are counted twice: once for reading and
+        once for writing.
+        """
+        ninplace_args = len(unique(self.args.inplace_buffers.values()))
+        num_bytes = []
+        for i, inp in enumerate(itertools.chain(self.input_nodes, (self.output_node,))):
+            size = V.graph.sizevars.size_hints(inp.get_size())
+            numel = functools.reduce(operator.mul, size)
+            dtype_size = get_dtype_size(inp.get_dtype())
+            num_bytes.append(numel * dtype_size * (1 + int(i < ninplace_args)))
+        return sum(num_bytes)
+
     def jit_line(self):
         if self.use_jit:
             return "@triton.jit"
@@ -119,10 +144,23 @@ class TritonTemplateKernel(TritonKernel):
             "constants": {},
         }
         triton_meta["configs"] = [config_of(signature)]
-        triton_meta["kernel_name"] = str(Placeholder.DESCRIPTIVE_NAME)
-        return (
-            f"@template(num_stages={self.num_stages}, num_warps={self.num_warps}, meta={triton_meta!r})\n"
-            + "@triton.jit"
+
+        inductor_meta = {
+            "kernel_name": str(Placeholder.DESCRIPTIVE_NAME),
+        }
+        if config.profile_bandwidth or config.benchmark_kernel:
+            num_gb = self.estimate_kernel_num_bytes() / 1e9
+            inductor_meta["kernel_num_gb"] = num_gb
+        return textwrap.dedent(
+            f"""
+            @template(
+                num_stages={self.num_stages},
+                num_warps={self.num_warps},
+                triton_meta={triton_meta!r},
+                inductor_meta={inductor_meta!r},
+            )
+            @triton.jit
+            """
         )
 
     def def_kernel(self, *argnames):
@@ -177,6 +215,7 @@ class TritonTemplateKernel(TritonKernel):
                     "from torch._inductor.triton_heuristics import template",
                     "from torch._inductor.utils import instance_descriptor",
                     "from torch._inductor import triton_helpers",
+                    TritonKernel.gen_attr_descriptor_import(),
                     "",
                     self.jit_line(),
                     f"def {self.kernel_name}({', '.join(arg_defs)}):",
@@ -258,7 +297,7 @@ class TritonTemplateKernel(TritonKernel):
             input_node.freeze_layout()
             epilogue_args.append(input_node.make_loader()(index_symbols))
 
-        V.ops.store(  # type: ignore[attr-defined]
+        V.ops.store(
             self.output_node.get_name(),
             output_index,
             self.epilogue_fn(*epilogue_args),
@@ -315,21 +354,22 @@ class TritonTemplateKernel(TritonKernel):
         self,
         index: sympy.Expr,
         *,
-        copy_shape=None,
         dense_indexing=False,
+        copy_shape=None,
         override_mask=None,
+        block_ptr=False,
     ):
         """
         Override the default indexing to use our custom mask and force
         dense indexing.
         """
-        result, *mask = super().indexing(
+        return super().indexing(
             index,
             dense_indexing=False,
             copy_shape=self.template_mask,
             override_mask=self.template_mask,
+            block_ptr=block_ptr,
         )
-        return (result, *mask)
 
     def initialize_range_tree(self, pid_cache):
         super().initialize_range_tree(pid_cache)
@@ -366,7 +406,6 @@ class TritonTemplateKernel(TritonKernel):
                 grid=grid,
             )
         else:
-            call_args = ", ".join(call_args)  # type: ignore[assignment]
             stream_name = wrapper.write_get_raw_stream(
                 V.graph.scheduler.current_device.index
             )
@@ -379,7 +418,7 @@ class TritonTemplateKernel(TritonKernel):
             ] + [meta]
             grid_call = f"{self.grid_fn.__module__}.{self.grid_fn.__name__}({', '.join(grid_call)})"
             wrapper.writeline(
-                f"{name}.run({call_args}, grid={grid_call}, stream={stream_name})"
+                f"{name}.run({', '.join(call_args)}, grid={grid_call}, stream={stream_name})"
             )
 
 
@@ -550,7 +589,7 @@ class ExternKernelChoice:
         assert callable(kernel)
         assert not hasattr(extern_kernels, name), "duplicate extern kernel"
         self.name = name
-        self.cpp_kernel = cpp_kernel
+        self.cpp_kernel_name = cpp_kernel
         self.has_out_variant = has_out_variant
         setattr(extern_kernels, name, kernel)
 
@@ -642,7 +681,7 @@ class ExternKernelCaller(ChoiceCaller):
         else:
             algo = self.to_callable()
             out_new = algo(*args)
-            torch._C._dynamo.guards.assert_size_stride(  # type: ignore[attr-defined]
+            torch._C._dynamo.guards.assert_size_stride(
                 out_new, tuple(out.size()), tuple(out.stride())
             )
             out.copy_(out_new)  # for correctness checking
@@ -677,8 +716,8 @@ class ExternKernelCaller(ChoiceCaller):
             cls(
                 layout=self.layout,
                 inputs=self.input_nodes,
-                kernel=self.choice.call_name(),
-                cpp_kernel=self.choice.cpp_kernel,
+                python_kernel_name=self.choice.call_name(),
+                cpp_kernel_name=self.choice.cpp_kernel_name,
                 ordered_kwargs_for_cpp_kernel=self.choice.ordered_kwargs_for_cpp_kernel,
                 kwargs=self.kwargs,
             )
@@ -706,6 +745,8 @@ class AlgorithmSelectorCache(PersistentCache):
         # generating a random torch.Tensor for benchmarking.
         input_gen_fns: Optional[Dict[int, Callable[[ir.Buffer], torch.Tensor]]] = None,
     ):
+        from .codegen.cuda.cuda_kernel import CUDATemplateCaller
+
         # TODO(nmacchioni): remove once CI tests are fixed
         choices = [choice for choice in choices if choice is not None]
         if len(choices) == 0:
@@ -713,7 +754,7 @@ class AlgorithmSelectorCache(PersistentCache):
                 "No choices to select, please consider adding ATEN into max_autotune_gemm_backends "
                 "config (defined in torch/_inductor/config.py) to allow at least one choice. "
             )
-        log.info("Max autotune selects from %s choices.", str(len(choices)))
+        log.debug("Max autotune selects from %s choices.", str(len(choices)))
 
         if len(choices) == 1:
             if not isinstance(choices[0], CUDATemplateCaller):
@@ -970,7 +1011,7 @@ class AlgorithmSelectorCache(PersistentCache):
         )
 
 
-_ALGORITHM_SELECTOR_CACHE = None
+_ALGORITHM_SELECTOR_CACHE: Optional[AlgorithmSelectorCache] = None
 
 
 def autotune_select_algorithm(*args, **kwargs):

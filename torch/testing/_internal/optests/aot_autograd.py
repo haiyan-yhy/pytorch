@@ -1,3 +1,5 @@
+# mypy: ignore-errors
+
 import torch
 import torch.utils._pytree as pytree
 from torch.testing._internal.common_methods_invocations import wrapper_set_seed
@@ -91,7 +93,7 @@ def _test_aot_autograd_forwards_backwards_helper(
     # Verify grads are equal between compiled and non-compiled versions of f.
 
     def call_forwards_backwards(f, args):
-        flat_args = pytree.tree_leaves(args)
+        flat_args = pytree.arg_tree_leaves(*args)
         diff_args = [arg for arg in flat_args if isinstance(arg, torch.Tensor) and
                      arg.requires_grad]
         out = wrapper_set_seed(f, args)

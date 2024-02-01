@@ -8,8 +8,8 @@ from .. import config
 from ..pattern_matcher import (
     _return_true,
     CallFunction,
+    fwd_only,
     Ignored,
-    inference_graph,
     init_once_fakemode,
     KeywordArg,
     Match,
@@ -50,7 +50,7 @@ def freezing_passes(gm: torch.fx.GraphModule, aot_example_inputs):
         constant_fold(gm)
         # Make sure meta['val'] is properly set for all nodes
         fake_tensor_prop(gm, aot_example_inputs, True)
-        binary_folding_pass.apply(gm.graph)
+        binary_folding_pass.apply(gm.graph)  # type: ignore[arg-type]
         # If we don't have binary folding, we don't need to run the pass again.
         # TODO: remove the need to run fake_tensor_prop on the whole model.
         if counters["inductor"]["binary_folding"] == binary_folding:
@@ -63,7 +63,7 @@ def freezing_passes(gm: torch.fx.GraphModule, aot_example_inputs):
     fake_tensor_prop(gm, aot_example_inputs, True)
 
     for pattern in pass_patterns:
-        pattern.apply(gm.graph)
+        pattern.apply(gm.graph)  # type: ignore[arg-type]
 
     # The CPU weight packing always assume the conv's weight is channels last,
     # So make sure the layout_optimization is on when doing it.
@@ -144,7 +144,7 @@ def addmm_patterns_init():
         matmul_fuse_pattern,
         matmul_replacement,
         [val(), val(), val(), val()],
-        inference_graph,
+        fwd_only,
         pass_patterns[0],
         extra_check=check_concat_weights,
         exclusive_arg_names=("w1", "w2", "w3"),
@@ -162,7 +162,7 @@ def addmm_patterns_init():
         matmul_fuse_pattern_two,
         matmul_replacement_two,
         [val(), val(), val()],
-        inference_graph,
+        fwd_only,
         pass_patterns[0],
         extra_check=check_concat_weights,
         exclusive_arg_names=("w1", "w2"),
@@ -184,7 +184,7 @@ def addmm_patterns_init():
         addmm_fuse_pattern_second,
         addmm_fuse_replacement_second,
         [val() for _ in range(7)],
-        inference_graph,
+        fwd_only,
         pass_patterns[0],
         extra_check=check_concat_weights,
         exclusive_arg_names=("w1", "w2", "w3", "b1", "b2", "b3"),
