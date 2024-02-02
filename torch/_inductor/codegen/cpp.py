@@ -270,6 +270,16 @@ def reduction_project(reduction_type, acc):
     return acc
 
 
+def is_to_lowp_dtype(expr):
+    to_exprs = ["cvt_fp32_to_lowp_fp", "c10::convert"]
+    if any(to_expr in expr for to_expr in to_exprs):
+        if "half" in expr:
+            return torch.half
+        if "bfloat16" in expr:
+            return torch.bfloat16
+    return None
+
+
 index_value_name_counter = 1
 
 
@@ -1326,6 +1336,10 @@ class CppVecOverrides(CppOverrides):
         ], f"{__name__} does not support {dtype}"
         node: torch.fx.Node = V.interpreter.current_node
         assert node and isinstance(node, torch.fx.Node)
+        if node.target == "store":
+            assert dtype == torch.float
+            assert src_dtype in DTYPE_LOWP_FP
+            return f"cvt_lowp_fp_to_fp32<{DTYPE_TO_CPP[src_dtype]}>({x})"
         opt_ctx_x = get_opt_ctx(node.args[1])
         assert opt_ctx_x
         if opt_ctx_x.dtype in (torch.float, torch.float32) and dtype == torch.bool:
@@ -1483,6 +1497,32 @@ class CppKernel(Kernel):
         finally:
             self._load_mask = prior
 
+    def cache_fp32_cse_var_before_store(self, var_to_store):
+        def find_fp32_var(var, cache):
+            fp32_cse_var = None
+            fp32_cse_var_name = None
+            lowp_dtype = None
+            for expr, cse_var in cache.items():
+                if cse_var == var:
+                    lowp_dtype = is_to_lowp_dtype(expr)
+                    if lowp_dtype:
+                        m = re.search(r"tmp\d+", expr)
+                        assert m
+                        fp32_cse_var_name = m.group()
+            if fp32_cse_var_name:
+                for cse_var in cache.values():
+                    if cse_var.name == fp32_cse_var_name:
+                        fp32_cse_var = cse_var
+                        break
+                assert fp32_cse_var is not None
+            return fp32_cse_var, lowp_dtype
+
+        fp32_var, lowp_dtype = find_fp32_var(var_to_store, self.cse.cache)
+        if fp32_var:
+            self.cse.cache[
+                self.overrides.to_dtype(var_to_store, torch.float32, lowp_dtype)
+            ] = fp32_var
+
     def scale_index_with_offset(
         self, index: sympy.Expr, scale=1, itervar_idx=-1, offset=0
     ):
@@ -1527,6 +1567,7 @@ class CppKernel(Kernel):
     def store(self, name, index, value, mode=None):
         assert "buf" in name
         var = self.args.output(name)
+        self.cache_fp32_cse_var_before_store(value)
         index = self.rename_indexing(index)
         if mode is None:
             line = f"{var}[{cexpr_index(index)}] = {value};"
@@ -2013,6 +2054,7 @@ class CppVecKernel(CppKernel):
             value = self.broadcast(value)
         opt_ctx: OptimizationContext = get_current_node_opt_ctx()
         var = self.args.output(name)
+        self.cache_fp32_cse_var_before_store(value)
         index = self.rename_indexing(index)
         self.stores.writeline(
             DeferredLine(
